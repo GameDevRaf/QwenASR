@@ -62,6 +62,10 @@ pub mod context;
 pub mod decoder;
 pub mod draft;
 pub mod encoder;
+#[cfg(not(windows))]
+pub mod int8_sidecar;
+#[cfg(windows)]
+#[path = "int8_sidecar_windows.rs"]
 pub mod int8_sidecar;
 #[cfg(feature = "android")]
 pub mod jni_api;

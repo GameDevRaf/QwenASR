@@ -19,6 +19,11 @@ pub fn superpage_vec<T: Copy>(n: usize) -> Vec<T> {
     if size < SUPERPAGE_SIZE {
         return vec![unsafe { std::mem::zeroed() }; n];
     }
+    #[cfg(windows)]
+    return vec![unsafe { std::mem::zeroed() }; n];
+
+    #[cfg(not(windows))]
+    {
     let mut ptr = std::ptr::null_mut();
     let rc = unsafe { libc::posix_memalign(&mut ptr, SUPERPAGE_SIZE, size) };
     if rc != 0 || ptr.is_null() {
@@ -27,6 +32,7 @@ pub fn superpage_vec<T: Copy>(n: usize) -> Vec<T> {
     unsafe {
         std::ptr::write_bytes(ptr, 0, size);
         Vec::from_raw_parts(ptr as *mut T, n, n)
+    }
     }
 }
 

@@ -1,6 +1,7 @@
 //! Safetensors mmap reader with multi-shard support.
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,8 +59,14 @@ impl TensorMeta {
 }
 
 pub struct SafetensorsFile {
+    #[cfg(unix)]
     fd: RawFd,
+    #[cfg(windows)]
+    file: std::fs::File,
+    #[cfg(windows)]
+    _mapping: memmap2::Mmap,
     data: *mut u8,
+    #[cfg(unix)]
     file_size: usize,
     header_size: usize,
     pub tensors: Vec<TensorMeta>,
@@ -71,6 +78,13 @@ unsafe impl Sync for SafetensorsFile {}
 
 impl SafetensorsFile {
     pub fn open(path: &str) -> Option<Self> {
+        #[cfg(windows)]
+        {
+            return Self::open_windows(path);
+        }
+
+        #[cfg(unix)]
+        {
         use libc::*;
         use std::ffi::CString;
 
@@ -180,6 +194,54 @@ impl SafetensorsFile {
             tensors,
             tensor_map,
         })
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_windows(path: &str) -> Option<Self> {
+        use std::fs::File;
+
+        let file = File::open(path).ok()?;
+        let file_size = file.metadata().ok()?.len() as usize;
+        if file_size < 8 {
+            return None;
+        }
+        let mapping = unsafe {
+            memmap2::MmapOptions::new()
+                .len(file_size)
+                .map(&file)
+                .ok()?
+        };
+        let data = mapping.as_ptr() as *mut u8;
+        let header_size = unsafe {
+            let mut buf = [0u8; 8];
+            std::ptr::copy_nonoverlapping(data, buf.as_mut_ptr(), 8);
+            u64::from_le_bytes(buf) as usize
+        };
+        if header_size > file_size - 8 {
+            return None;
+        }
+        let header_json = unsafe {
+            let slice = std::slice::from_raw_parts(data.add(8), header_size);
+            std::str::from_utf8(slice).ok()?
+        };
+        let tensors = parse_header(header_json)?;
+        let mut tensor_map = HashMap::new();
+        for (i, t) in tensors.iter().enumerate() {
+            tensor_map.insert(t.name.clone(), i);
+        }
+        let data_base = 8 + header_size;
+        let skip = build_prefault_skip(&tensors, data_base, file_size);
+        prefault_with_skip(data as *const u8, file_size, &skip);
+
+        Some(SafetensorsFile {
+            file,
+            _mapping: mapping,
+            data,
+            header_size,
+            tensors,
+            tensor_map,
+        })
     }
 
     /// Read `dst.len()` bytes of `tensor`'s data starting `byte_off` bytes into
@@ -188,6 +250,8 @@ impl SafetensorsFile {
     /// an explicit offset and does not touch the shared fd offset, so concurrent
     /// calls from multiple loader threads are safe.
     pub fn read_tensor_bytes(&self, tensor: &TensorMeta, byte_off: usize, dst: &mut [u8]) -> bool {
+        #[cfg(unix)]
+        {
         let base = 8 + self.header_size + tensor.data_offset + byte_off;
         let mut done = 0usize;
         while done < dst.len() {
@@ -204,7 +268,23 @@ impl SafetensorsFile {
             }
             done += r as usize;
         }
-        true
+        return true;
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let base = (8 + self.header_size + tensor.data_offset + byte_off) as u64;
+            let mut done = 0usize;
+            while done < dst.len() {
+                let read = match self.file.seek_read(&mut dst[done..], base + done as u64) {
+                    Ok(value) if value > 0 => value,
+                    _ => return false,
+                };
+                done += read;
+            }
+            return true;
+        }
     }
 
     pub fn find(&self, name: &str) -> Option<&TensorMeta> {
@@ -253,11 +333,17 @@ impl SafetensorsFile {
 }
 
 fn page_size() -> usize {
+    #[cfg(windows)]
+    { return 4096; }
+
+    #[cfg(unix)]
+    {
     let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if ps > 0 {
         ps as usize
     } else {
         16 * 1024
+    }
     }
 }
 
@@ -298,16 +384,20 @@ fn prefault_with_skip(data: *const u8, file_size: usize, skip: &[bool]) {
     }
 
     // WILLNEED on contiguous non-skipped runs only.
+    #[cfg(unix)]
     let base_addr = data as usize;
     let mut run_start: Option<usize> = None;
     for (page, &skip_page) in skip.iter().enumerate() {
         match (run_start, !skip_page) {
             (None, true) => run_start = Some(page),
-            (Some(s), false) => {
-                let off = s * ps;
+            (Some(_s), false) => {
+                #[cfg(unix)]
+                {
+                let off = _s * ps;
                 let end = (page * ps).min(file_size);
                 unsafe {
                     libc::madvise((base_addr + off) as *mut _, end - off, libc::MADV_WILLNEED);
+                }
                 }
                 run_start = None;
             }
@@ -315,14 +405,17 @@ fn prefault_with_skip(data: *const u8, file_size: usize, skip: &[bool]) {
         }
     }
     // Close a run that extends to the end of the file.
-    if let Some(s) = run_start {
-        let off = s * ps;
+    if let Some(_s) = run_start {
+        #[cfg(unix)]
+        {
+        let off = _s * ps;
         unsafe {
             libc::madvise(
                 (base_addr + off) as *mut _,
                 file_size - off,
                 libc::MADV_WILLNEED,
             );
+        }
         }
     }
 
@@ -359,6 +452,8 @@ fn prefault_with_skip(data: *const u8, file_size: usize, skip: &[bool]) {
 
 impl Drop for SafetensorsFile {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
         if !self.data.is_null() {
             unsafe {
                 libc::munmap(self.data as *mut _, self.file_size);
@@ -368,6 +463,7 @@ impl Drop for SafetensorsFile {
             unsafe {
                 libc::close(self.fd);
             }
+        }
         }
     }
 }
